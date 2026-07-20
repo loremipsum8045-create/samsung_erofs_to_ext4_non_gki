@@ -32,7 +32,7 @@ jobs:
     - name: Preparing Files
       run: |
         # Downloading and extracting necessary files
-        wget https://sourceforge.net/projects/samsung-galaxy-a01-m01/files/erofs_ext4.zip
+        wget https://drive.google.com/file/d/1DSAOLWf6ENnN2sT4ECPLtmF15729o5y6/view?usp=sharing
         unzip erofs_ext4.zip
         rm -r erofs_ext4.zip
 
