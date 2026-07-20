@@ -28,11 +28,12 @@ jobs:
         sudo apt update
         sudo apt install -y cpio bc android-sdk-libsparse-utils lz4 git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils
         sudo apt install -y zip xz-utils unzip p7zip-full wget
+        sudo pip install -y gdown
         
     - name: Preparing Files
       run: |
         # Downloading and extracting necessary files
-        wget https://drive.google.com/file/d/1DSAOLWf6ENnN2sT4ECPLtmF15729o5y6/view?usp=sharing
+        gdown https://drive.google.com/file/d/1DSAOLWf6ENnN2sT4ECPLtmF15729o5y6/view?usp=sharing
         unzip erofs_ext4.zip
         rm -r erofs_ext4.zip
 
