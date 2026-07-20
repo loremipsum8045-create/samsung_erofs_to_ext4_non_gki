@@ -28,7 +28,7 @@ jobs:
         sudo apt update
         sudo apt install -y cpio bc android-sdk-libsparse-utils lz4 git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils
         sudo apt install -y zip xz-utils unzip p7zip-full wget
-        sudo pip install -y gdown
+        sudo pip install gdown
         
     - name: Preparing Files
       run: |
