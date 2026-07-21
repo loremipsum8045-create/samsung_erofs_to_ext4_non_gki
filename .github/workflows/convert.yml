@@ -14,20 +14,19 @@ on:
         description: 'Firmware version'
         required: true
         default: 'EG - :A055FXXU2AWK1'
-
 jobs:
   Build:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v2
-
     - name: Install Dependencies
       run: |
         sudo apt update
         sudo apt install -y cpio bc android-sdk-libsparse-utils lz4 git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils
         sudo apt install -y zip xz-utils unzip p7zip-full wget
+        sudo apt install -y f2fs-tools attr rsync
+        sudo modprobe f2fs || true
         sudo pip install gdown
         
     - name: Preparing Files
@@ -36,7 +35,6 @@ jobs:
         gdown https://drive.google.com/file/d/1DSAOLWf6ENnN2sT4ECPLtmF15729o5y6/view?usp=sharing
         unzip erofs_ext4.zip
         rm -r erofs_ext4.zip
-
     - name: Downloading given firmware
       run: |
         # Downloading Stock rom
@@ -49,10 +47,8 @@ jobs:
       run: |
         # Building the ROM
         ./down
-
     - name: Rename file
       run: mv ./last/EXT4_RW_AP.zip ./last/${{ github.event.inputs.Firmware }}.zip
-
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
