@@ -2,56 +2,344 @@ name: Samsung EROFS to EXT4
 on:
   push:
     branches:
-      - main  # Change this to your desired branch
+      - main
   workflow_dispatch:
     inputs:
       GSI:
         description: 'Samfw Link For AP'
         required: true
         default: ' AP LINK FROM SAMFW'
-      
       Firmware:
         description: 'Firmware version'
         required: true
         default: 'EG - :A055FXXU2AWK1'
+
 jobs:
   Build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v2
-    - name: Install Dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y cpio bc android-sdk-libsparse-utils lz4 git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils
-        sudo apt install -y zip xz-utils unzip p7zip-full wget
-        sudo apt install -y f2fs-tools attr rsync
-        sudo apt install -y linux-modules-extra-$(uname -r) && sudo modprobe f2fs
-        sudo modprobe f2fs || true
-        sudo pip install gdown
-        
-    - name: Preparing Files
-      run: |
-        # Downloading and extracting necessary files
-        gdown https://drive.google.com/file/d/1DSAOLWf6ENnN2sT4ECPLtmF15729o5y6/view?usp=sharing
-        unzip erofs_ext4.zip
-        rm -r erofs_ext4.zip
-    - name: Downloading given firmware
-      run: |
-        # Downloading Stock rom
-        wget -O ap.zip ${{ github.event.inputs.GSI }} 
-        chmod +x *
-        chmod 755 bin/*
-        chmod 755 aik/bin/*
-    
-    - name: Converting
-      run: |
-        # Building the ROM
-        ./down
-    - name: Rename file
-      run: mv ./last/EXT4_RW_AP.zip ./last/${{ github.event.inputs.Firmware }}.zip
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: EXT4_RW_AP
-        path: ./last/${{ github.event.inputs.Firmware }}.zip
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        # tools/bin, tools/aik, tools/prebuilt must be committed in this repo
+        # (see tools.zip) - this replaces the old gdown-from-Drive step.
+        # Because they're now version-controlled, a run can never silently
+        # break due to someone else pushing a new erofs_ext4.zip underneath you.
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cpio bc lz4 git device-tree-compiler xz-utils zlib1g-dev \
+            gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils \
+            erofs-utils zip unzip wget f2fs-tools attr rsync util-linux e2fsprogs
+          # Best-effort: some GitHub-hosted runner images ship this module,
+          # some don't (it's a known gap, not guaranteed to exist). We check
+          # for it properly later and fail with a clear message if missing,
+          # rather than silently producing a broken build.
+          sudo apt install -y "linux-modules-extra-$(uname -r)" 2>/dev/null || true
+          sudo modprobe f2fs 2>/dev/null || true
+
+          chmod -R 755 tools/bin tools/aik/bin
+          chmod 755 tools/aik/*.sh
+
+      - name: Downloading given firmware
+        run: |
+          wget -O ap.zip "${{ github.event.inputs.GSI }}"
+          ls -la ap.zip
+          file ap.zip
+          SIZE=$(stat -c%s ap.zip)
+          if [ "$SIZE" -lt 500000000 ]; then
+            echo "ERROR: ap.zip is only $SIZE bytes - this is almost certainly an" \
+                 "expired/invalid samfw link (a real AP file is multiple GB), not real firmware."
+            exit 1
+          fi
+
+      - name: Unpack AP and locate super.img
+        run: |
+          rm -rf odin && mkdir odin
+          unzip -q ap.zip -d odin
+          rm -f ap.zip
+
+          count=$(ls -1 odin/*.tar.md5 2>/dev/null | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "ERROR: expected exactly one .tar.md5 in the AP file, found $count."
+            echo "Make sure you downloaded the AP file only (not BL/CP/CSC/HOME_CSC)."
+            exit 1
+          fi
+
+          tar -xf odin/*.tar.md5 -C odin
+          rm -f odin/*.tar.md5
+
+          rm -rf lz4work && mkdir lz4work
+          mv odin/super.img.lz4 odin/boot.img.lz4 odin/recovery.img.lz4 \
+             odin/vbmeta.img.lz4 odin/vbmeta_system.img.lz4 lz4work/
+          rm -rf odin
+
+          for f in super boot recovery vbmeta vbmeta_system; do
+            lz4 -d -c "lz4work/${f}.img.lz4" > "lz4work/${f}.img"
+          done
+          rm -f lz4work/*.lz4
+
+          rm -rf rom stat && mkdir rom stat
+          mv lz4work/super.img rom/
+          mv lz4work/boot.img lz4work/recovery.img lz4work/vbmeta.img lz4work/vbmeta_system.img stat/
+          rm -rf lz4work
+
+      - name: Split super.img into partitions
+        run: |
+          simg2img rom/super.img rom/super.raw
+          rm -f rom/super.img
+          ORIG_SUPER_SIZE=$(stat -c%s rom/super.raw)
+          echo "$ORIG_SUPER_SIZE" > orignal_super_size
+          echo "Super size: $ORIG_SUPER_SIZE bytes"
+
+          ./tools/bin/lpunpack rom/super.raw
+          rm -f rom/super.raw
+          rm -rf ori && mkdir ori
+          mv system.img ori/
+          mv system_ext.img ori/ 2>/dev/null || true
+          mv product.img odm.img vendor.img ori/
+
+      - name: Detect filesystem and unpack partitions
+        run: |
+          s_type=$(blkid -o value -s TYPE ori/system.img)
+          p_type=$(blkid -o value -s TYPE ori/product.img)
+          v_type=$(blkid -o value -s TYPE ori/vendor.img)
+          o_type=$(blkid -o value -s TYPE ori/odm.img)
+          echo "system=$s_type product=$p_type vendor=$v_type odm=$o_type"
+
+          if [[ "$s_type" == "erofs" && "$p_type" == "erofs" && "$v_type" == "erofs" && "$o_type" == "erofs" ]]; then
+            echo "FS_TYPE=erofs" >> "$GITHUB_ENV"
+          elif [[ "$s_type" == "f2fs" && "$p_type" == "f2fs" && "$v_type" == "f2fs" && "$o_type" == "f2fs" ]]; then
+            echo "FS_TYPE=f2fs" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: partitions are not all the same recognized format (EROFS or F2FS). Aborting."
+            exit 1
+          fi
+
+      - name: Unpack EROFS partitions
+        if: env.FS_TYPE == 'erofs'
+        run: |
+          rm -rf product system system_ext config vendor odm && mkdir config
+
+          ./tools/bin/extract.erofs -x -f -i ori/system.img
+          ./tools/bin/extract.erofs -x -f -i ori/vendor.img
+          ./tools/bin/extract.erofs -x -f -i ori/odm.img
+          ./tools/bin/extract.erofs -x -f -i ori/product.img
+          if [ -e ori/system_ext.img ]; then
+            ./tools/bin/extract.erofs -x -f -i ori/system_ext.img
+          fi
+
+          for p in system vendor odm product system_ext; do
+            [ -d "$p" ] || continue
+            [ "$(find "$p" -type f | wc -l)" -lt 5 ] && \
+              { echo "ERROR: $p extraction looks empty"; exit 1; }
+          done
+
+      - name: Unpack F2FS partitions
+        if: env.FS_TYPE == 'f2fs'
+        run: |
+          rm -rf product system system_ext config vendor odm && mkdir config
+          MNT="./__f2fs_mnt"
+
+          extract_one() {
+            local img="$1" part="$2"
+            [ -e "$img" ] || return 1
+            echo "Extracting $part ($img)..."
+            mkdir -p "./$part" "$MNT"
+
+            if ! sudo mount -o loop,ro -t f2fs "$img" "$MNT"; then
+              echo "ERROR: failed to mount $img as f2fs"
+              echo "--- blkid ---"; blkid "$img"
+              echo "--- dmesg tail ---"; dmesg 2>/dev/null | tail -20
+              echo ""
+              echo "This runner's kernel does not have f2fs support available."
+              echo "See the 'linux-modules-extra' install step above - if it failed,"
+              echo "this device's firmware cannot currently be built on a GitHub-hosted"
+              echo "runner and needs a self-hosted runner with f2fs kernel support instead."
+              return 1
+            fi
+
+            sudo rsync -aAX --numeric-ids "$MNT"/ "./$part"/ || { sudo umount "$MNT"; return 1; }
+            sudo chown -R "$(id -u)":"$(id -g)" "./$part"
+            sudo umount "$MNT"
+
+            local file_count
+            file_count=$(find "./$part" -type f | wc -l)
+            if [ "$file_count" -lt 5 ]; then
+              echo "ERROR: $part only has $file_count files after extraction"
+              return 1
+            fi
+            echo "$part: extracted $file_count files"
+
+            # fs_config: root entry MUST be unprefixed (empty path), every
+            # other entry MUST be prefixed with "<part>/". e2fsdroid fails
+            # with "failed to find X in canned fs_config" if this is wrong
+            # in either direction - confirmed against the real binary.
+            {
+              printf '%s %s %s %s\n' "" "$(stat -c '%u' "./$part")" "$(stat -c '%g' "./$part")" "$(stat -c '%a' "./$part")"
+              find "./$part" -mindepth 1 -printf "$part/%P %U %G %#m\n" | sed -E 's/ 0([0-7]{3,4})$/ \1/'
+            } > "./config/${part}_fs_config"
+
+            # file_contexts: one exact-match rule per real file (built from
+            # its security.selinux xattr), plus a catch-all wildcard so
+            # filesystem-internal entries like lost+found still get a
+            # valid context.
+            : > "./config/${part}_file_contexts"
+            find "./$part" | while read -r f; do
+              rel="${f#./$part}"
+              ctx=$(getfattr -n security.selinux --only-values --absolute-names "$f" 2>/dev/null)
+              if [ -n "$ctx" ]; then
+                escaped=$(printf '%s' "/$part$rel" | sed -e 's/\\/\\\\/g' -e 's/[.^$*+?(){}|]/\\&/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g')
+                echo "^${escaped}\$    ${ctx}" >> "./config/${part}_file_contexts"
+              fi
+            done
+            echo "^/$part(/.*)?\$    u:object_r:${part}_file:s0" >> "./config/${part}_file_contexts"
+
+            local ctx_count
+            ctx_count=$(wc -l < "./config/${part}_file_contexts")
+            if [ "$ctx_count" -lt 5 ]; then
+              echo "ERROR: only captured $ctx_count SELinux contexts for $part"
+              return 1
+            fi
+            echo "$part: captured $ctx_count file contexts"
+            return 0
+          }
+
+          FAILED=0
+          extract_one ori/system.img system || FAILED=1
+          extract_one ori/vendor.img vendor || FAILED=1
+          extract_one ori/odm.img odm || FAILED=1
+          extract_one ori/product.img product || FAILED=1
+          if [ -e ori/system_ext.img ]; then
+            extract_one ori/system_ext.img system_ext || FAILED=1
+          fi
+          rmdir "$MNT" > /dev/null 2>&1
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "F2FS extraction failed for one or more partitions. Aborting build."
+            exit 1
+          fi
+
+      - name: Write readme info from build.prop
+        run: |
+          code_name=$(grep "ro.product.system.device" system/system/build.prop | cut -d= -f2 | tr -d '[:space:]')
+          model=$(grep "ro.product.system.model" system/system/build.prop | cut -d= -f2 | tr -d '[:space:]')
+          android_version=$(grep "ro.system.build.version.release_or_codename" system/system/build.prop | cut -d= -f2 | tr -d '[:space:]')
+          firmware=$(grep "ro.system.build.version.incremental" system/system/build.prop | cut -d= -f2 | tr -d '[:space:]')
+          {
+            echo "Code_Name          = $code_name"
+            echo "Model              = $model"
+            echo "Android Version    = $android_version"
+            echo "Firmware           = $firmware"
+            echo ""
+            echo "Flash the same version $firmware of BL CP AP CSC according to your country before flashing EXT4 RW AP File"
+            echo ""
+            echo "https://samfw.com/firmware/$model"
+            echo ""
+            echo "Download and flash BL AP CP CSC (original), let device boot to android,"
+            echo "then flash ext4 RW AP.tar and format data."
+          } > readme.txt
+
+      - name: Pack partitions as EXT4
+        run: |
+          rm -rf out_ext4 && mkdir out_ext4
+
+          pack_erofs() {
+            local part="$1" mount="$2"
+            local size adj
+            size=$(du -sb "./$part" | awk '{print $1}')
+            adj=$((size + 100*1024*1024))
+            ./tools/bin/make_ext4fs -J -T -1 -S "./config/${part}_file_contexts" -C "./config/${part}_fs_config" \
+              -l "$adj" -a "$mount" "${part}.new.img" "$part"
+            mv "${part}.new.img" out_ext4/
+          }
+
+          pack_f2fs() {
+            local part="$1" mount="$2"
+            local size adj blocks
+            size=$(du -sb "./$part" | awk '{print $1}')
+            adj=$((size + 100*1024*1024))
+            blocks=$(( (adj + 4095) / 4096 ))
+            ./tools/bin/mke2fs -O ^has_journal -L "$part" -I 256 -M "$mount" -m 0 -t ext4 -b 4096 "${part}.new.img" "$blocks"
+            ./tools/bin/e2fsdroid -e -T -1 -S "./config/${part}_file_contexts" -C "./config/${part}_fs_config" \
+              -a "$mount" -f "$part" "${part}.new.img"
+            mv "${part}.new.img" out_ext4/
+          }
+
+          for p in system:/system vendor:/vendor odm:/odm product:/product system_ext:/system_ext; do
+            part="${p%%:*}"; mount="${p##*:}"
+            [ -d "./$part" ] || continue
+            echo "Packing $part..."
+            if [ "$FS_TYPE" == "erofs" ]; then
+              pack_erofs "$part" "$mount"
+            else
+              pack_f2fs "$part" "$mount"
+            fi
+          done
+
+          rm -rf system vendor odm product system_ext config
+
+      - name: Build super.new.img
+        run: |
+          read -r size_super < orignal_super_size
+
+          args="--metadata-size 65536 --super-name super --metadata-slots 2 --device super:$size_super --group main:$size_super"
+          total=0
+          for p in system vendor odm product system_ext; do
+            img="out_ext4/${p}.new.img"
+            [ -e "$img" ] || continue
+            sz=$(stat -c%s "$img")
+            total=$((total + sz))
+            args="$args --partition $p:readonly:$sz:main --image $p=$img"
+          done
+
+          if [ "$total" -ge "$size_super" ]; then
+            echo "ERROR: packed EXT4 images ($total bytes) do not fit in the original super partition ($size_super bytes)."
+            exit 1
+          fi
+
+          ./tools/bin/lpmake $args --sparse --output super.new.img
+          rm -rf out_ext4
+
+          rm -rf last && mkdir last
+          mv super.new.img last/
+
+      - name: Patch fstab in boot image
+        run: |
+          rm -rf tools/aik/unsigned-new.img tools/aik/ramdisk tools/aik/split_img
+          cp stat/boot.img tools/aik/
+          ( cd tools/aik && ./unpackimg.sh && ./t.sh && ./repackimg.sh )
+          cp tools/aik/unsigned-new.img last/boot.img
+
+      - name: Patch AVB vbmeta
+        run: |
+          if strings stat/vbmeta.img | grep -q "1.2.0"; then
+            cp tools/prebuilt/1.2/vbmeta.img last/
+          else
+            cp tools/prebuilt/1.1/vbmeta.img last/
+          fi
+          if strings stat/vbmeta_system.img | grep -q "1.2.0"; then
+            cp tools/prebuilt/1.2/vbmeta_system.img last/
+          else
+            cp tools/prebuilt/1.1/vbmeta_system.img last/
+          fi
+
+      - name: Pack final tar and zip
+        run: |
+          cp readme.txt last/
+          mv last/super.new.img last/super.img
+          cd last
+          tar -cf ext4_rw_ap.tar boot.img vbmeta.img vbmeta_system.img super.img
+          rm -f boot.img vbmeta.img vbmeta_system.img super.img
+          zip -r EXT4_RW_AP.zip ext4_rw_ap.tar readme.txt
+          rm -f ext4_rw_ap.tar readme.txt
+          ls -la EXT4_RW_AP.zip
+
+      - name: Rename file
+        run: mv ./last/EXT4_RW_AP.zip "./last/${{ github.event.inputs.Firmware }}.zip"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXT4_RW_AP
+          path: ./last/${{ github.event.inputs.Firmware }}.zip
