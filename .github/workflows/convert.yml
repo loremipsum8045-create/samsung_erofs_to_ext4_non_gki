@@ -243,23 +243,62 @@ jobs:
       - name: Pack partitions as EXT4
         run: |
           rm -rf out_ext4 && mkdir out_ext4
+          read -r size_super < orignal_super_size
+
+          declare -A CONTENT_SIZE
+          base_total=0
+          for p in system vendor odm product system_ext; do
+            [ -d "./$p" ] || continue
+            sz=$(du -sb "./$p" | awk '{print $1}')
+            CONTENT_SIZE[$p]=$sz
+            base_total=$((base_total + sz))
+          done
+
+          # Reserve a small safety margin for actual ext4 metadata overhead
+          # (this is separate from the deliberate writable headroom below).
+          overhead_reserve=$(( size_super * 5 / 1000 ))
+          available_slack=$(( size_super - base_total - overhead_reserve ))
+
+          if [ "$available_slack" -le 0 ]; then
+            echo "ERROR: real partition content ($base_total bytes) already leaves no room"
+            echo "in the original super partition ($size_super bytes) for ANY writable headroom."
+            echo "This device's super partition is already fully utilized by stock firmware -"
+            echo "an EXT4 RW conversion isn't possible without shrinking something."
+            exit 1
+          fi
+
+          DEFAULT_PAD=$((100*1024*1024))
+          MIN_PAD=$((16*1024*1024))
+          n_parts=${#CONTENT_SIZE[@]}
+          ideal_total_pad=$(( n_parts * DEFAULT_PAD ))
+
+          declare -A PAD
+          if [ "$ideal_total_pad" -le "$available_slack" ]; then
+            echo "Using standard 100MB/partition writable headroom (fits comfortably)."
+            for p in "${!CONTENT_SIZE[@]}"; do
+              PAD[$p]=$DEFAULT_PAD
+            done
+          else
+            echo "Standard 100MB/partition headroom (${ideal_total_pad} bytes) doesn't fit in"
+            echo "the available slack (${available_slack} bytes) - distributing what's"
+            echo "actually available proportionally by partition size instead."
+            for p in "${!CONTENT_SIZE[@]}"; do
+              share=$(( available_slack * CONTENT_SIZE[$p] / base_total ))
+              [ "$share" -lt "$MIN_PAD" ] && share=$MIN_PAD
+              PAD[$p]=$share
+            done
+          fi
 
           pack_erofs() {
-            local part="$1" mount="$2"
-            local size adj
-            size=$(du -sb "./$part" | awk '{print $1}')
-            adj=$((size + 100*1024*1024))
+            local part="$1" mount="$2" adj="$3"
             ./tools/bin/make_ext4fs -J -T -1 -S "./config/${part}_file_contexts" -C "./config/${part}_fs_config" \
               -l "$adj" -a "$mount" "${part}.new.img" "$part"
             mv "${part}.new.img" out_ext4/
           }
 
           pack_f2fs() {
-            local part="$1" mount="$2"
-            local size adj blocks
-            size=$(du -sb "./$part" | awk '{print $1}')
-            adj=$((size + 100*1024*1024))
-            blocks=$(( (adj + 4095) / 4096 ))
+            local part="$1" mount="$2" adj="$3"
+            local blocks=$(( (adj + 4095) / 4096 ))
             ./tools/bin/mke2fs -O ^has_journal -L "$part" -I 256 -M "$mount" -m 0 -t ext4 -b 4096 "${part}.new.img" "$blocks"
             ./tools/bin/e2fsdroid -e -T -1 -S "./config/${part}_file_contexts" -C "./config/${part}_fs_config" \
               -a "$mount" -f "$part" "${part}.new.img"
@@ -269,11 +308,12 @@ jobs:
           for p in system:/system vendor:/vendor odm:/odm product:/product system_ext:/system_ext; do
             part="${p%%:*}"; mount="${p##*:}"
             [ -d "./$part" ] || continue
-            echo "Packing $part..."
+            adj=$(( CONTENT_SIZE[$part] + PAD[$part] ))
+            echo "Packing $part (content=${CONTENT_SIZE[$part]} bytes, headroom=${PAD[$part]} bytes)..."
             if [ "$FS_TYPE" == "erofs" ]; then
-              pack_erofs "$part" "$mount"
+              pack_erofs "$part" "$mount" "$adj"
             else
-              pack_f2fs "$part" "$mount"
+              pack_f2fs "$part" "$mount" "$adj"
             fi
           done
 
@@ -308,7 +348,18 @@ jobs:
         run: |
           rm -rf tools/aik/unsigned-new.img tools/aik/ramdisk tools/aik/split_img
           cp stat/boot.img tools/aik/
-          ( cd tools/aik && ./unpackimg.sh && ./t.sh && ./repackimg.sh )
+          ./tools/aik/unpackimg.sh
+          ./tools/aik/t.sh
+
+          if grep -rl "erofs" tools/aik/ramdisk/fstab.* > /dev/null 2>&1; then
+            echo "ERROR: fstab still references erofs after patching - t.sh did not update it."
+            grep -r "erofs" tools/aik/ramdisk/fstab.*
+            exit 1
+          fi
+          echo "fstab patched OK:"
+          cat tools/aik/ramdisk/fstab.*
+
+          ./tools/aik/repackimg.sh
           cp tools/aik/unsigned-new.img last/boot.img
 
       - name: Patch AVB vbmeta
