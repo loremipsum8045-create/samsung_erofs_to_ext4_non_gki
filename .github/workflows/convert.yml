@@ -43,19 +43,7 @@ jobs:
         chmod +x *
         chmod 755 bin/*
         chmod 755 aik/bin/*
-      
-    - name: Debug extracted files
-      run: |
-          echo "Broken symlinks:"
-          find system -xtype l || true
-      
-          echo "Special files:"
-          find system \( -type b -o -type c -o -type p -o -type s \) || true
-      
-          echo "Permissions"
-          find system -printf "%M %u %g %p\n" > system.txt
-      
-          head -50 system.txt
+        
     - name: Converting
       run: |
         # Building the ROM
